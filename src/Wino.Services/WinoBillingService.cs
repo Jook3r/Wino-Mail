@@ -56,7 +56,15 @@ public sealed class WinoBillingService(
     public Task<ApiEnvelope<BillingStatusResultDto>> GetStatusAsync(CancellationToken cancellationToken = default)
         => apiClient.GetBillingStatusAsync(cancellationToken);
 
-    public async Task<bool> HasUnlimitedAccountsAsync(CancellationToken cancellationToken = default)
+    // Personal build: every account is unlocked without the Unlimited Accounts add-on.
+    // The purchase check below stays in place so upstream changes to it still merge cleanly.
+    public Task<bool> HasUnlimitedAccountsAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(true);
+    }
+
+    private async Task<bool> HasPurchasedUnlimitedAccountsAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
