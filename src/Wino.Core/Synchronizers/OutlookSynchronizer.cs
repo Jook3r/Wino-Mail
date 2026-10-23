@@ -102,6 +102,8 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
     public override uint BatchModificationSize => 20;
     public override uint InitialMessageDownloadCountPerFolder => 1000;
     private const uint MaximumAllowedBatchRequestSize = 20;
+    private const int MaximumThrottledBatchAttempts = 5;
+    private static readonly TimeSpan MaximumThrottledBatchRetryDelay = TimeSpan.FromSeconds(60);
     private const int SimpleAttachmentUploadLimitBytes = 3 * 1024 * 1024;
     private const int MaximumUploadSessionAttachmentSizeBytes = 150 * 1024 * 1024;
     private const int LargeAttachmentUploadChunkSizeBytes = 320 * 1024;
@@ -4044,17 +4046,77 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
 
     private async Task ExecuteBatchRequestsAsync(IEnumerable<IRequestBundle<RequestInformation>> batch, CancellationToken cancellationToken)
     {
-        var batchContent = new BatchRequestContentCollection(_graphClient);
-        var itemCount = batch.Count();
+        var pendingBundles = batch.ToList();
 
-        if (itemCount == 0) return;
+        if (pendingBundles.Count == 0) return;
 
-        var bundleIdMap = await PrepareBatchContentAsync(batch, batchContent, itemCount);
+        // Outlook allows only a few concurrent requests per mailbox, and Graph runs the steps of a batch in
+        // parallel, so large batches (bulk delete, move, mark read) get some steps throttled with 429
+        // MailboxConcurrency. Those steps are sent again after the server's Retry-After. Serial batches are
+        // not retried step by step: a throttled step there fails every step that depends on it.
+        var retryThrottledSteps = !pendingBundles.Any(RequiresSerialExecution);
+        var errors = new List<string>();
 
-        // Execute batch to collect responses from network call
-        var batchRequestResponse = await _graphClient.Batch.PostAsync(batchContent, cancellationToken);
+        for (var attempt = 1; ; attempt++)
+        {
+            var batchContent = new BatchRequestContentCollection(_graphClient);
+            var bundleIdMap = await PrepareBatchContentAsync(pendingBundles, batchContent, pendingBundles.Count);
 
-        await ProcessBatchResponsesAsync(batch, batchRequestResponse, bundleIdMap);
+            // Execute batch to collect responses from network call
+            var batchRequestResponse = await _graphClient.Batch.PostAsync(batchContent, cancellationToken);
+
+            var throttledBundles = retryThrottledSteps && attempt < MaximumThrottledBatchAttempts
+                ? new List<IRequestBundle<RequestInformation>>()
+                : null;
+
+            var retryAfter = await ProcessBatchResponsesAsync(batchRequestResponse, bundleIdMap, errors, throttledBundles);
+
+            if (throttledBundles is not { Count: > 0 }) break;
+
+            var delay = GetThrottledBatchRetryDelay(attempt, retryAfter);
+            _logger.Information("Outlook throttled {Count} batch steps for {AccountId}. Retrying in {Delay}.",
+                throttledBundles.Count, Account.Id, delay);
+
+            pendingBundles = throttledBundles;
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (errors.Any())
+        {
+            ThrowBatchExecutionException(errors);
+        }
+    }
+
+    private static bool RequiresSerialExecution(IRequestBundle<RequestInformation> bundle)
+        => bundle.UIChangeRequest is SendDraftRequest
+            or MailCategoryUpdateRequest
+            or MailCategoryDeleteRequest;
+
+    private static TimeSpan GetThrottledBatchRetryDelay(int attempt, TimeSpan? retryAfter)
+    {
+        var backoff = TimeSpan.FromSeconds(Math.Pow(2, attempt))
+                      + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1000));
+
+        var delay = retryAfter.HasValue && retryAfter.Value > backoff ? retryAfter.Value : backoff;
+        return delay > MaximumThrottledBatchRetryDelay ? MaximumThrottledBatchRetryDelay : delay;
+    }
+
+    private static TimeSpan? GetRetryAfter(HttpResponseMessage response)
+    {
+        var retryAfter = response?.Headers?.RetryAfter;
+        if (retryAfter == null)
+            return null;
+
+        if (retryAfter.Delta.HasValue)
+            return retryAfter.Delta.Value;
+
+        if (retryAfter.Date.HasValue)
+        {
+            var delay = retryAfter.Date.Value - DateTimeOffset.UtcNow;
+            return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
+        }
+
+        return null;
     }
 
     private async Task<Dictionary<string, IRequestBundle<RequestInformation>>> PrepareBatchContentAsync(
@@ -4068,9 +4130,13 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
         for (int i = 0; i < itemCount; i++)
         {
             var bundle = batch.ElementAt(i);
-            requiresSerial |= bundle.UIChangeRequest is SendDraftRequest
-                              or MailCategoryUpdateRequest
-                              or MailCategoryDeleteRequest;
+            requiresSerial |= RequiresSerialExecution(bundle);
+
+            // A retried step is added again; rewind the body the previous batch already read.
+            if (bundle.NativeRequest.Content is { CanSeek: true } content)
+            {
+                content.Position = 0;
+            }
 
             // UI changes are already applied in ExecuteNativeRequestsAsync before batching.
             var batchRequestId = await batchContent.AddBatchRequestStepAsync(bundle.NativeRequest);
@@ -4098,12 +4164,18 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
         }
     }
 
-    private async Task ProcessBatchResponsesAsync(
-        IEnumerable<IRequestBundle<RequestInformation>> batch,
+    /// <summary>
+    /// Handles each step's response and adds failures to <paramref name="errors"/>. When
+    /// <paramref name="throttledBundles"/> is given, throttled steps are collected there for another attempt
+    /// instead of failing, and the longest Retry-After among them is returned.
+    /// </summary>
+    private async Task<TimeSpan?> ProcessBatchResponsesAsync(
         BatchResponseContentCollection batchResponse,
-        Dictionary<string, IRequestBundle<RequestInformation>> bundleIdMap)
+        Dictionary<string, IRequestBundle<RequestInformation>> bundleIdMap,
+        List<string> errors,
+        List<IRequestBundle<RequestInformation>>? throttledBundles)
     {
-        var errors = new List<string>();
+        TimeSpan? retryAfter = null;
 
         foreach (var bundleId in bundleIdMap.Keys)
         {
@@ -4114,7 +4186,15 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
 
             using (response)
             {
-                if (!response.IsSuccessStatusCode)
+                if (throttledBundles != null && response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    throttledBundles.Add(bundle);
+
+                    var stepRetryAfter = GetRetryAfter(response);
+                    if (stepRetryAfter.HasValue && (!retryAfter.HasValue || stepRetryAfter > retryAfter))
+                        retryAfter = stepRetryAfter;
+                }
+                else if (!response.IsSuccessStatusCode)
                 {
                     await HandleFailedResponseAsync(bundle, response, errors);
                 }
@@ -4125,10 +4205,7 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
             }
         }
 
-        if (errors.Any())
-        {
-            ThrowBatchExecutionException(errors);
-        }
+        return retryAfter;
     }
 
     private async Task HandleFailedResponseAsync(
